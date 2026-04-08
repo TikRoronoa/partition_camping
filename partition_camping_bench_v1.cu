@@ -1,236 +1,179 @@
-/**
- * partition_camping_bench.cu
- * ─────────────────────────────────────────────────────────────────────────────
- * 验证 RTX 3080 12GB (384-bit, 12 Memory Partitions) 上的 Partition Camping 现象。
- *
- * 测量策略：
- *   对给定 LDA，让每个 warp 顺序读取矩阵的一整行（= LDA 个 FP32 元素）。
- *   当所有行的首地址都映射到同一个显存分区时，访存队列会在该分区堆积，
- *   导致有效带宽大幅下降。
- *
- * 编译（需要 CUDA 12+，Compute Capability 8.6）：
- *   nvcc -O3 -arch=sm_86 -o bench partition_camping_bench.cu -lnvToolsExt
- *
- * 运行：
- *   ./bench
- *
- * 可选：配合 Nsight Systems 捕获：
- *   nsys profile --trace=cuda,nvtx ./bench
- * ─────────────────────────────────────────────────────────────────────────────
- */
-
-#include <cstdio>
-#include <cstdlib>
-#include <cmath>
-#include <vector>
-#include <algorithm>
 #include <cuda_runtime.h>
-#include <nvToolsExt.h>
+#include <stdio.h>
 
-// ── 编译期常量 ──────────────────────────────────────────────────────────────
-static constexpr int   NROWS        = 1024;      // 矩阵行数（越大越稳定）
-static constexpr int   WARMUP_ITERS = 5;
-static constexpr int   BENCH_ITERS  = 20;
-static constexpr int   N_PARTITIONS = 12;
-static constexpr int   GRANULE_B    = 16;        // 每分区粒度 (bytes)
-static constexpr int   STRIPE_B     = N_PARTITIONS * GRANULE_B; // 192 bytes
+#include <numeric>  // 用于 std::iota
+#include <vector>
 
-// ── 错误检查宏 ──────────────────────────────────────────────────────────────
-#define CUDA_CHECK(expr)                                                       \
-    do {                                                                       \
-        cudaError_t _e = (expr);                                               \
-        if (_e != cudaSuccess) {                                               \
-            fprintf(stderr, "[CUDA ERROR] %s:%d  %s\n",                       \
-                    __FILE__, __LINE__, cudaGetErrorString(_e));               \
-            exit(EXIT_FAILURE);                                                \
-        }                                                                      \
+#define CHECK_CUDA(call)                                                  \
+    do {                                                                  \
+        cudaError_t err = call;                                           \
+        if (err != cudaSuccess) {                                         \
+            fprintf(stderr, "CUDA Error: %s\n", cudaGetErrorString(err)); \
+            exit(1);                                                      \
+        }                                                                 \
     } while (0)
 
-// ── Kernel：每个 block 读取矩阵的一行，累加到 sink 防止编译器优化掉 ─────────
-__global__ void row_read_kernel(const float* __restrict__ mat,
-                                float*       __restrict__ sink,
-                                int lda, int nrows)
-{
-    int row = blockIdx.x;
-    if (row >= nrows) return;
-
-    const float* row_ptr = mat + (long long)row * lda;
-
-    float acc = 0.f;
-    // 每个线程步进 blockDim.x，覆盖整行
-    for (int col = threadIdx.x; col < lda; col += blockDim.x)
-        acc += row_ptr[col];
-
-    // warp reduce
-    for (int mask = 16; mask > 0; mask >>= 1)
-        acc += __shfl_xor_sync(0xffffffff, acc, mask);
-
-    if (threadIdx.x == 0)
-        atomicAdd(sink, acc);
+// 禁用L1/L2的线性访问
+__global__ void linear_nocache(float* out, const float* in, size_t n) {
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t total = (size_t)gridDim.x * blockDim.x;
+    for (size_t i = idx; i < n; i += total) {
+        float val;
+        asm volatile("ld.global.cv.f32 %0, [%1];" : "=f"(val) : "l"(&in[i]));
+        float res = val * 2.0f + 1.0f;
+        asm volatile("st.global.cg.f32 [%0], %1;" ::"l"(&out[i]), "f"(res));
+    }
 }
 
-// ── 测量单个 LDA 的有效带宽 (GB/s) ─────────────────────────────────────────
-struct BenchResult {
-    int   lda;
-    float bw_gbs;       // 有效带宽
-    int   camping_part; // 行首落入的分区（-1 = 分散）
-    bool  is_conflict;
-};
-
-BenchResult measure_lda(int lda)
-{
-    // 分配显存：NROWS × lda 个 float
-    size_t bytes = (size_t)NROWS * lda * sizeof(float);
-    float *d_mat, *d_sink;
-    CUDA_CHECK(cudaMalloc(&d_mat,  bytes));
-    CUDA_CHECK(cudaMalloc(&d_sink, sizeof(float)));
-    CUDA_CHECK(cudaMemset(d_mat,  0, bytes));
-    CUDA_CHECK(cudaMemset(d_sink, 0, sizeof(float)));
-
-    // 初始化：填 1.0f
-    // 用 cudaMemset 只能设 0，改用 kernel 或 cudaMemsetAsync + host memset
-    {
-        std::vector<float> h(lda, 1.f);
-        for (int r = 0; r < NROWS; r++)
-            CUDA_CHECK(cudaMemcpy(d_mat + (long long)r * lda,
-                                  h.data(), lda * sizeof(float),
-                                  cudaMemcpyHostToDevice));
+// 禁用L1/L2的partition camping测试
+__global__ void camping_nocache(float* out, const float* in, size_t n, size_t partition_size) {
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t total = (size_t)gridDim.x * blockDim.x;
+    for (size_t i = idx; i < n; i += total) {
+        size_t pos = i % partition_size;
+        float val;
+        asm volatile("ld.global.cv.f32 %0, [%1];" : "=f"(val) : "l"(&in[pos]));
+        float res = val * 2.0f + 1.0f;
+        asm volatile("st.global.cg.f32 [%0], %1;" ::"l"(&out[pos]), "f"(res));
     }
-
-    dim3 grid(NROWS), block(256);
-    cudaEvent_t ev0, ev1;
-    CUDA_CHECK(cudaEventCreate(&ev0));
-    CUDA_CHECK(cudaEventCreate(&ev1));
-
-    // Warmup
-    for (int i = 0; i < WARMUP_ITERS; i++)
-        row_read_kernel<<<grid, block>>>(d_mat, d_sink, lda, NROWS);
-    CUDA_CHECK(cudaDeviceSynchronize());
-
-    // Benchmark
-    char tag[64];
-    snprintf(tag, sizeof(tag), "LDA=%d", lda);
-    nvtxRangePushA(tag);
-
-    CUDA_CHECK(cudaEventRecord(ev0));
-    for (int i = 0; i < BENCH_ITERS; i++)
-        row_read_kernel<<<grid, block>>>(d_mat, d_sink, lda, NROWS);
-    CUDA_CHECK(cudaEventRecord(ev1));
-    CUDA_CHECK(cudaEventSynchronize(ev1));
-
-    nvtxRangePop();
-
-    float ms = 0.f;
-    CUDA_CHECK(cudaEventElapsedTime(&ms, ev0, ev1));
-    ms /= BENCH_ITERS;
-
-    // 有效读取量 = NROWS × lda × 4 bytes
-    double read_bytes = (double)NROWS * lda * sizeof(float);
-    float  bw_gbs     = (float)(read_bytes / (ms * 1e-3) / 1e9);
-
-    // 判断是否冲突：(lda × 4) mod 192 == 0
-    int lda_bytes = lda * (int)sizeof(float);
-    bool conflict = (lda_bytes % STRIPE_B) == 0;
-    int  part0    = (int)((0LL % STRIPE_B) / GRANULE_B); // row 0 总是 P0
-    // row 1 的分区：若 conflict，仍然 P0
-    long long row1_byte = (long long)lda_bytes % STRIPE_B;
-    int part1 = (int)(row1_byte / GRANULE_B);
-
-    CUDA_CHECK(cudaFree(d_mat));
-    CUDA_CHECK(cudaFree(d_sink));
-    CUDA_CHECK(cudaEventDestroy(ev0));
-    CUDA_CHECK(cudaEventDestroy(ev1));
-
-    BenchResult r;
-    r.lda         = lda;
-    r.bw_gbs      = bw_gbs;
-    r.camping_part = conflict ? 0 : part1;
-    r.is_conflict  = conflict;
-    return r;
 }
 
-// ── 主函数 ──────────────────────────────────────────────────────────────────
-int main()
-{
-    // 打印 GPU 信息
-    cudaDeviceProp prop;
-    CUDA_CHECK(cudaGetDeviceProperties(&prop, 0));
-    printf("═══════════════════════════════════════════════════════════════\n");
-    printf("  GPU: %s  |  显存: %.0f GB  |  位宽: %d-bit\n",
-           prop.name,
-           prop.totalGlobalMem / 1e9,
-           prop.memoryBusWidth);
-    printf("  理论峰值带宽: %.1f GB/s\n",
-           2.0 * prop.memoryClockRate * 1e3 * (prop.memoryBusWidth / 8) / 1e9);
-    printf("  N_PARTITIONS=%d  GRANULE=%d B  STRIPE=%d B\n",
-           N_PARTITIONS, GRANULE_B, STRIPE_B);
-    printf("  矩阵行数 NROWS=%d  迭代次数=%d\n", NROWS, BENCH_ITERS);
-    printf("═══════════════════════════════════════════════════════════════\n\n");
+// 带缓存版本
+__global__ void linear_cached(float* out, const float* in, size_t n) {
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t total = (size_t)gridDim.x * blockDim.x;
+    // #pragma unroll
+    for (size_t i = idx; i < n; i += total) {
+        out[i] = in[i] * 2.0f + 1.0f;
+    }
+}
 
-    // ── 第一部分：系统扫描 LDA 4096~8192，步长 64 ──────────────────────────
-    printf("【扫描段】LDA 4096 → 8192  (步长 64)\n");
-    printf("%-8s  %-12s  %-8s  %s\n", "LDA", "带宽(GB/s)", "冲突?", "行首分区");
-    printf("────────  ────────────  ────────  ────────\n");
+float measure_linear(float* out, float* in, size_t n, int iters) {
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
 
-    std::vector<BenchResult> results;
-    for (int lda = 4096; lda <= 8192; lda += 64) {
-        BenchResult r = measure_lda(lda);
-        results.push_back(r);
-        printf("%-8d  %-12.2f  %-8s  P%d\n",
-               r.lda, r.bw_gbs,
-               r.is_conflict ? "★ 冲突" : "  OK",
-               r.camping_part);
-        fflush(stdout);
+    linear_nocache<<<1024, 256>>>(out, in, n);
+    cudaDeviceSynchronize();
+
+    cudaEventRecord(start);
+    for (int i = 0; i < iters; i++) linear_nocache<<<1024, 256>>>(out, in, n);
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+
+    float ms;
+    cudaEventElapsedTime(&ms, start, stop);
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+
+    // 线性访问：实际传输 n * 2（读+写）
+    return (float)n * sizeof(float) * 2.0f * iters / (ms * 1e6);
+}
+
+float measure_camping(float* out, float* in, size_t n, size_t psize, int iters) {
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+
+    camping_nocache<<<1024, 256>>>(out, in, n, psize);
+    cudaDeviceSynchronize();
+
+    cudaEventRecord(start);
+    for (int i = 0; i < iters; i++) camping_nocache<<<1024, 256>>>(out, in, n, psize);
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+
+    float ms;
+    cudaEventElapsedTime(&ms, start, stop);
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+
+    // 关键修正：camping时实际只访问了partition_size范围
+    // 虽然循环n次，但取模后实际DRAM传输是 psize * 2 * iters
+    // 但由于L2缓存，小psize会被缓存，所以实际DRAM流量更低
+    // 这里按实际DRAM传输计算（保守估计）
+    return (float)psize * sizeof(float) * 2.0f * iters / (ms * 1e6);
+}
+
+// 带缓存的 Partition Camping 测试内核
+__global__ void camping_cached_kernel(float* out, const float* in, size_t n, size_t partition_size) {
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t total = (size_t)gridDim.x * blockDim.x;
+    for (size_t i = idx; i < n; i += total) {
+        size_t pos = i % partition_size;
+        // 使用标准 C++ 赋值，允许编译器生成带缓存的 ld.global (L1/L2)
+        out[pos] = in[pos] * 2.0f + 1.0f;
+    }
+}
+
+// 对应的测量函数
+float measure_camping_cached(float* out, float* in, size_t n, size_t psize, int iters) {
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+
+    // 预热：这一步非常重要，因为我们要把数据填满 L2
+    camping_cached_kernel<<<1024, 256>>>(out, in, n, psize);
+    cudaDeviceSynchronize();
+
+    cudaEventRecord(start);
+    for (int i = 0; i < iters; i++) camping_cached_kernel<<<1024, 256>>>(out, in, n, psize);
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+
+    float ms;
+    cudaEventElapsedTime(&ms, start, stop);
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+
+    return (float)psize * sizeof(float) * 2.0f * iters / (ms * 1e6);
+}
+
+int main() {
+    size_t n = 8 * 1024 * 1024;  // 32MB
+    size_t bytes = n * sizeof(float);
+
+    printf("RTX 3080 Partition Camping (No L1/L2 Cache)\n");
+    printf("Data: %zu MB\n\n", bytes / 1024 / 1024);
+
+    float *d_in, *d_out;
+    cudaMalloc(&d_in, bytes);
+    cudaMalloc(&d_out, bytes);
+    cudaMemset(d_in, 0x3F, bytes);
+
+    // 基准：禁用缓存的线性访问
+    float base = measure_linear(d_out, d_in, n, 50);
+    printf("Linear (no cache): %.2f GB/s\n\n", base);
+
+    // Camping测试（禁用缓存）
+    printf("Partition(MB) | Bandwidth(GB/s) | vs Linear | Status\n");
+    printf("--------------|-----------------|-----------|--------\n");
+
+    std::vector<float> sizes;
+    for (float s = 0.25f; s <= 64.0f; s += 0.25f) {
+        sizes.push_back(s);
     }
 
-    // ── 第二部分：精细对比 —— 典型冲突 vs 加 padding 修复 ─────────────────
-    printf("\n═══════════════════════════════════════════════════════════════\n");
-    printf("【精细对比】冲突 LDA vs 加 +8 padding 修复\n");
-    printf("═══════════════════════════════════════════════════════════════\n");
+    for (int i = 0; i < sizes.size(); i++) {
+        size_t psize = static_cast<size_t>(sizes[i] * 1024.0f * 1024.0f / sizeof(float));
+        if (psize > n) psize = n;
+        
+#ifndef CACHE
+        float bw = measure_camping(d_out, d_in, n, psize, 50);
+#else
+        float bw = measure_camping_cached(d_out, d_in, n, psize, 50);        
+#endif
+        float ratio = bw / base;
 
-    struct Pair { int bad; int good; const char* note; };
-    Pair pairs[] = {
-        { 4608, 4616, "4608 (典型冲突)  vs  4616 (+8 pad)" },
-        { 6144, 6152, "6144 (严重冲突)  vs  6152 (+8 pad)" },
-        { 4800, 4808, "4800 (冲突)      vs  4808 (+8 pad)" },
-        { 7680, 7688, "7680 (冲突)      vs  7688 (+8 pad)" },
-    };
+        const char* status = (ratio < 0.3f) ? "*** CAMPING ***" : (ratio < 0.6f) ? "** SLOW **" : "OK";
 
-    for (auto& p : pairs) {
-        BenchResult rbad  = measure_lda(p.bad);
-        BenchResult rgood = measure_lda(p.good);
-        float delta = rgood.bw_gbs - rbad.bw_gbs;
-        float pct   = delta / rbad.bw_gbs * 100.f;
-        printf("\n  %s\n", p.note);
-        printf("    冲突  LDA=%-6d  带宽= %6.2f GB/s\n", p.bad,  rbad.bw_gbs);
-        printf("    修复  LDA=%-6d  带宽= %6.2f GB/s  (+%.1f%%)\n",
-               p.good, rgood.bw_gbs, pct);
+        printf("%-13.2f | %-15.2f | %-9.2f | %s\n", sizes[i], bw, ratio, status);
     }
 
-    // ── 第三部分：统计摘要 ────────────────────────────────────────────────
-    printf("\n═══════════════════════════════════════════════════════════════\n");
-    printf("【摘要统计】\n");
+    printf("\nNote: Bandwidth calculated by actual DRAM bytes transferred\n");
+    printf("      (partition_size * 2 for read+write)\n");
 
-    float sum_conflict = 0, sum_ok = 0;
-    int   cnt_conflict = 0, cnt_ok = 0;
-    float min_conflict = 1e9, max_ok = 0;
-
-    for (auto& r : results) {
-        if (r.is_conflict) { sum_conflict += r.bw_gbs; cnt_conflict++; min_conflict = std::min(min_conflict, r.bw_gbs); }
-        else               { sum_ok       += r.bw_gbs; cnt_ok++;       max_ok       = std::max(max_ok,       r.bw_gbs); }
-    }
-
-    if (cnt_conflict > 0 && cnt_ok > 0) {
-        float avg_c = sum_conflict / cnt_conflict;
-        float avg_o = sum_ok       / cnt_ok;
-        printf("  冲突 LDA 数量: %d  平均带宽: %.2f GB/s  最低: %.2f GB/s\n",
-               cnt_conflict, avg_c, min_conflict);
-        printf("  正常 LDA 数量: %d  平均带宽: %.2f GB/s  最高: %.2f GB/s\n",
-               cnt_ok, avg_o, max_ok);
-        printf("  性能差距（正常/冲突）: %.2fx\n", avg_o / avg_c);
-    }
-
-    printf("═══════════════════════════════════════════════════════════════\n");
-    printf("完成。\n");
+    cudaFree(d_in);
+    cudaFree(d_out);
     return 0;
 }
