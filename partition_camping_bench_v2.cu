@@ -114,13 +114,13 @@ static TimedResult time_kernel_stride(const float* d_buf, int stride_floats,
 static int partitions_touched(int stride_bytes)
 {
     // 追踪前 NUM_PARTITIONS 次访问各自落在哪个分区
-    int seen[12] = {0};
+    int seen[NUM_PARTITIONS] = {0};
     int count = 0;
     long addr = 0;
     for (int i = 0; i < 1000; i++) {
-        int p = (int)((addr / 256) % 12);
+        int p = (int)((addr / 256) % NUM_PARTITIONS);
         if (!seen[p]) { seen[p] = 1; count++; }
-        if (count == 12) break;
+        if (count == NUM_PARTITIONS) break;
         addr += stride_bytes;
     }
     return count;
@@ -157,6 +157,7 @@ static void exp1_stride_sweep(const float* d_buf, float* d_sink)
         4096+3072, // 最坏叠加
         65536,  // 64 KB, gcd(65536,3072)=1024 → 3分区
         196608, // 192 KB = 64 * 3072 → camping
+        197632, // 193 KB
     };
 
     double peak_bw = 912.0;  // RTX 3080 12G 理论峰值 GB/s (384-bit × 19 Gbps / 8)
