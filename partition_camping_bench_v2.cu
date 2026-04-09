@@ -239,7 +239,7 @@ static void exp3_partition_count(const float* d_buf, float* d_sink)
     };
 
     double peak_bw = 912.0;
-    for (int ci = 0; ci < 6; ci++) {
+    for (int ci = 0; ci < sizeof(cases)/sizeof(cases[0]); ci++) {
         int k  = cases[ci].k;
         int sb = cases[ci].stride_bytes;
         int sf = sb / (int)sizeof(float);
@@ -281,7 +281,7 @@ static void exp4_cache_exclusion(const float* d_buf, float* d_sink)
     int stride_bytes = 3072;
     int stride_floats = stride_bytes / (int)sizeof(float);
 
-    for (int si = 0; si < 8; si++) {
+    for (int si = 0; si < sizeof(sizes_mb)/sizeof(sizes_mb[0]); si++) {
         long mb      = sizes_mb[si];
         long buf_f   = mb * 1024 * 1024 / sizeof(float);
         long active_n = buf_f / stride_floats;
