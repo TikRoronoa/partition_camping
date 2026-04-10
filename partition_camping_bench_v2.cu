@@ -138,8 +138,13 @@ static void exp1_stride_sweep(const float* d_buf, float* d_sink)
     // 测试从 4B (单元素) 到 192KB 的步长
     int strides_bytes[] = {
         4,      // 连续访问 → 最优
-        64,     // 半 cache line
-        128,    // 一个 cache line
+        32,     // 每分区 2 transaction, 间隔一个sector
+        64,     // 每分区 2 transaction,2个sector，半 cache line
+        96,     // 每分区 2 transaction
+        128,    // 每分区 2.67 transaction, 4个sector,一个 cache line, 
+        160,    // 每分区 3.33 transaction
+        192,    // 每分区 4 transaction
+        224,    // 
         256,    // partition granularity
         512,
         768,
@@ -147,6 +152,9 @@ static void exp1_stride_sweep(const float* d_buf, float* d_sink)
         1536,
         2048,
         3072,   // = 256*12 → camping! 所有线程落同一分区
+        3072+256,
+        3072+256*2,
+        3072+256*3,
         4096,   // = 3072+1024, 公因子大
         6144,   // 2 * 3072 → camping
         9216,   // 3 * 3072 → camping
@@ -560,3 +568,153 @@ camping 实验的目的 是测量 GPU 对显存的持续施压能力——通常
 真正的 camping 压力测试需要刻意制造 Row Conflict，才能真实反映 warp 争抢显存的拥塞延迟。如果恰好踩到 row-aligned stride，反而让每个 warp 都"轻松过关"，测到的是最优情况而非最差情况，与 camping 实验的初衷背道而驰。
  * 
  */
+
+
+ /**
+  * 
+  * 
+  * 
+  * 
+  * 
+
+一些重要的结论：
+
+## 重新看数据
+
+```
+stride=32:  108.6 GB/s
+stride=64:  108.5 GB/s
+stride=96:  107.7 GB/s
+stride=128: 101.7 GB/s
+```
+
+stride=32 到 stride=96 几乎完全相同，stride=128 才开始下降。
+
+## 先算清楚每种情况 DRAM 实际收到了什么
+
+```
+stride=32, warp 32线程：
+  地址：0, 32, 64, ..., 992
+  覆盖范围：[0, 1024)
+  128B 对齐的 transaction 数 = 1024/128 = 8 个
+
+stride=64, warp 32线程：
+  地址：0, 64, 128, ..., 1984
+  覆盖范围：[0, 2048)
+  128B transaction 数 = 2048/128 = 16 个
+
+stride=128, warp 32线程：
+  地址：0, 128, 256, ..., 3968
+  覆盖范围：[0, 4096)
+  128B transaction 数 = 4096/128 = 32 个
+```
+
+transaction 数量是 8、16、32，翻倍增长。但带宽 108、108、101，几乎不变。
+
+**这说明 transaction 数量翻倍，DRAM 完成这些 transaction 的时间也翻倍了。带宽 = 有效字节/时间，分子（有效字节 = active_n × 4B）不变，分母（时间）也不变，所以带宽不变。**
+
+但为什么时间不变？transaction 多了一倍，不应该花更多时间吗？
+
+---
+
+## 关键：DRAM 的并发处理能力
+
+DRAM 不是串行处理 transaction 的，而是靠多个 bank 并发处理：
+
+```
+stride=32:  8 个 transaction，覆盖 [0, 1024)
+  这 8 个 transaction 打到 1024/256 ≈ 4 个分区
+  每个分区处理 2 个 transaction
+  4 个分区并行 → 实际耗时 ≈ 2 个 transaction 的时间
+
+stride=64: 16 个 transaction，覆盖 [0, 2048)
+  打到 2048/256 ≈ 8 个分区
+  每个分区处理 2 个 transaction
+  8 个分区并行 → 实际耗时 ≈ 2 个 transaction 的时间
+```
+
+两种情况下每个分区的负载相同，耗时相同，所以总带宽相同。
+
+---
+
+## 用这个模型验证 stride=128 为什么开始下降
+
+```
+stride=128: 32 个 transaction，覆盖 [0, 4096)
+  打到 4096/256 = 16 个分区，但 GA102 只有 12 个分区
+  → 有些分区需要处理多于 2 个 transaction
+  → 部分分区成为瓶颈，整体带宽开始下降
+```
+
+验证：
+
+```
+stride=32:  每分区负载 = 8 transaction / 4 分区 = 2 个
+stride=64:  每分区负载 = 16 transaction / 8 分区 = 2 个  ← 相同！
+stride=96:  每分区负载 = 24 transaction / 12 分区 = 2 个 ← 相同！
+stride=128: 每分区负载 = 32 transaction / 12 分区 = 2.67 个 ← 增加了！
+```
+
+**stride=32、64、96 时每个分区的负载完全相同（2 个 transaction），所以带宽完全相同。stride=128 开始每分区负载超过 2，带宽开始下降。**
+
+这也预测了一个新的现象：
+
+```
+stride=96 之后带宽应该持续下降
+stride=32×N 时如果每分区负载恰好是整数，带宽应该有局部平台
+```
+
+回看实验数据：
+
+```
+stride=32:  108.6 GB/s  每分区 2 transaction
+stride=64:  108.5 GB/s  每分区 2 transaction
+stride=96:  107.7 GB/s  每分区 2 transaction
+stride=128: 101.7 GB/s  每分区 2.67 transaction ← 开始下降 ✓
+stride=160:  87.2 GB/s  每分区 3.33 transaction
+stride=192:  73.9 GB/s  每分区 4 transaction
+stride=256:  59.3 GB/s  每分区 5.33 transaction
+stride=512:  57.9 GB/s  每分区 ← 分区数变成6了，另一个效应
+```
+
+stride=192（每分区恰好 4 个 transaction）应该是一个局部低点，之后 stride=224 每分区 4.67，stride=256 每分区 5.33，带宽应该继续下降但有轻微波动。
+
+实测：
+
+```
+stride=192: 73.9 GB/s
+stride=224: 66.3 GB/s
+stride=256: 59.3 GB/s
+```
+
+单调下降，没有明显的局部平台，说明每分区负载不是整数时的带宽变化是平滑的，不像我预测的那样有阶跃。这可能是因为不同分区的负载并不是均匀分布的，实际情况更复杂。
+
+---
+
+## 最终结论
+
+**stride=32 和 stride=64 带宽相同的真实原因：**
+
+```
+两种 stride 下，warp 的访问地址恰好分散到相同数量的分区
+每个分区收到的 transaction 数量相同
+各分区并行处理，总耗时相同
+→ 有效带宽相同
+
+具体：
+  stride=32: 8 transaction，分布到 4 分区，每分区 2 个
+  stride=64: 16 transaction，分布到 8 分区，每分区 2 个
+  每分区负载相同 → 带宽相同
+
+stride=128 开始下降：
+  32 transaction 超过了 12 分区的均匀承载能力（12×2=24）
+  部分分区过载 → 整体带宽下降
+```
+  * 
+  * 
+  * 
+  * 
+  * 
+  * 
+  * 
+  */
